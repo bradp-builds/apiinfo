@@ -1,0 +1,308 @@
+#!/usr/bin/env bash
+# Explore an HTTP endpoint with a bounded GET, HEAD and OPTIONS.
+set -uo pipefail
+VERSION=0.1.0
+verbose=0 color=1 timeout=15 cap=1048576
+usage() {
+    cat <<'HELP'
+Usage: apiinfo [--verbose] [--no-color] [--timeout SECONDS] URL
+Explore an authorized HTTP(S) endpoint using GET, HEAD and OPTIONS.
+  --verbose       Expand response structure, preview and headers
+  --no-color      Disable terminal colors (also honors NO_COLOR)
+  --timeout N     Per-request timeout in seconds (default: 15)
+  --help          Show help
+  --version       Show version
+At most six requests; same-origin GET redirects only (three hops).
+Bodies are limited to 1 MiB. Even GET requests can have side effects.
+Body previews may contain sensitive application data.
+HELP
+}
+url=''
+while (($#)); do
+    case $1 in
+        --verbose) verbose=1 ;;
+        --no-color) color=0 ;;
+        --timeout)
+            shift
+            if (($# == 0)) || [[ ! $1 =~ ^[1-9][0-9]*$ ]]; then echo 'Invalid timeout' >&2; exit 2; fi
+            timeout=$1 ;;
+        --help|-h) usage; exit 0 ;;
+        --version) echo "apiinfo $VERSION"; exit 0 ;;
+        -*) echo "Unknown option: $1" >&2; exit 2 ;;
+        *) if [[ -n $url ]]; then usage >&2; exit 2; fi; url=$1 ;;
+    esac
+    shift
+done
+for dep in curl jq; do
+    command -v "$dep" >/dev/null || { echo "Missing dependency: $dep" >&2; exit 2; }
+done
+# Reject credentials and ambiguous authorities. Query strings are accepted but hidden in output.
+origin() {
+    local value=$1 scheme authority host port
+    [[ $value =~ ^(https?)://([^/?#]+) ]] || return 1
+    scheme=${BASH_REMATCH[1]}; authority=${BASH_REMATCH[2],,}
+    [[ $authority != *@* && $authority != *\\* && $authority != *[[:space:]]* ]] || return 1
+    if [[ $authority =~ ^(\[[0-9a-f:.]+\]|[a-z0-9._-]+)(:([0-9]+))?$ ]]; then
+        host=${BASH_REMATCH[1]}; port=${BASH_REMATCH[3]}
+    else return 1; fi
+    [[ -n $port ]] || { if [[ $scheme == https ]]; then port=443; else port=80; fi; }
+    printf '%s://%s:%s' "$scheme" "$host" "$port"
+}
+base_origin=$(origin "$url") || { echo 'Supply an HTTP(S) URL without embedded credentials.' >&2; exit 2; }
+[[ -t 1 && ! ${NO_COLOR+x} ]] || color=0
+clean() { jq -Rjs 'gsub("[\u0000-\u0008\u000b-\u001f\u007f-\u009f]"; "")'; }
+safe_url() {
+    local display=$1
+    if [[ $display =~ ^(([Hh][Tt][Tt][Pp][Ss]?:)?//)([^/?#]*@)(.*)$ ]]; then
+        display="${BASH_REMATCH[1]}[credentials hidden]@${BASH_REMATCH[4]}"
+    fi
+    printf '%s' "${display%%[?#]*}" | clean | head -c 2000; [[ $display != *'?'* ]] || printf '?[query hidden]'; }
+section() { if ((color)); then printf '\n\033[1;36m%s\033[0m\n' "$1"; else printf '\n%s\n' "$1"; fi; }
+tmp=$(mktemp -d) || exit 2
+trap 'rm -rf -- "$tmp"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+observations=()
+transport=0
+request() {
+    local method=$1 target=$2 prefix=$3 rc=0 reason
+    local -a extra=()
+    [[ $method != HEAD ]] || extra+=(--head)
+    # Disable user curl configuration and proxies' CONNECT headers. Never persist cookies.
+    (ulimit -f 1024; curl -q --silent --show-error --globoff --proto '=http,https' \
+        --connect-timeout 5 --max-time "$timeout" --max-filesize "$cap" \
+        --user-agent "apiinfo/$VERSION" --suppress-connect-headers --request "$method" "${extra[@]}" \
+        --dump-header "$prefix.headers" --output "$prefix.body" \
+        --write-out '%{json}' --url "$target" >"$prefix.meta" 2>"$prefix.error") || rc=$?
+    printf '%s' "$rc" >"$prefix.rc"
+    if ((rc)); then
+        transport=1
+        case $rc in
+            6) reason='Could not resolve host' ;;
+            7) reason='Could not connect to server' ;;
+            28) reason='Request timed out' ;;
+            60) reason='TLS certificate verification failed' ;;
+            63) reason='Response exceeds size limit' ;;
+            *) reason='Transfer failed or exceeded a local resource limit' ;;
+        esac
+        observations+=("$method: $reason (curl exit $rc); transfer incomplete.")
+    fi
+    [[ -f $prefix.body ]] || : >"$prefix.body"
+}
+meta() { jq -r "$2 // empty" "$1.meta" 2>/dev/null || true; }
+header() {
+    # Reset on every status line, retaining only the final response block (including after 1xx).
+    awk -v key="$2" '
+        /^HTTP\// {value=""}
+        {line=$0; sub(/\r$/, "", line); pos=index(line, ":")
+         if (pos && tolower(substr(line,1,pos-1))==tolower(key)) {
+             v=substr(line,pos+1); sub(/^[ \t]+/, "", v); value=(value=="" ? v : value ", " v)
+         }} END {print value}' "$1.headers" | clean
+}
+# Best-effort metadata extraction, deliberately bounded rather than a full HTML parser.
+# Attributes use first-value-wins semantics; never evaluate response text as shell code.
+attributes() {
+    local input=$1 matched key value
+    local pattern="^[[:space:];]*([[:alnum:]_:-]+)([[:space:]]*=[[:space:]]*(\"([^\"]*)\"|'([^']*)'|([^[:space:];>]+)))?"
+    attrs=()
+    while [[ $input =~ $pattern ]]; do
+        matched=${BASH_REMATCH[0]}; key=${BASH_REMATCH[1],,}
+        value=${BASH_REMATCH[4]}${BASH_REMATCH[5]}${BASH_REMATCH[6]}
+        [[ ${attrs[$key]+present} ]] || attrs[$key]=$value
+        input=${input:${#matched}}
+    done
+}
+html_text() {
+    # A small, documented entity subset. Decode ampersands last to avoid double decoding.
+    local text=$1 limit=${2:-500}
+    text=${text//&quot;/\"}; text=${text//&#34;/\"}
+    text=${text//&apos;/\'}; text=${text//&#39;/\'}
+    text=${text//&lt;/<}; text=${text//&gt;/>}
+    text=${text//&nbsp;/ }; text=${text//&amp;/\&}
+    printf '%s' "$text" | clean | tr '\n\r\t' '   ' | head -c "$limit"
+}
+advertised_link() {
+    local source=$1 target=$2 rel=${3,,} type=${4,,} label key seen
+    rel=" ${rel//$'\t'/ } "; rel=${rel//$'\n'/ }
+    if [[ $rel == *' https://api.w.org/ '* ]]; then label='API root'
+    elif [[ $rel == *' alternate '* && ( $type == application/json || $type == application/*+json ) ]]; then label='Alternate JSON representation'
+    else return; fi
+    [[ -n $target ]] || return
+    # Accept HTTP(S) URLs or relative references, never javascript/data and similar schemes.
+    if [[ $target == *:* && ! $target =~ ^[Hh][Tt][Tt][Pp][Ss]?:// ]]; then return; fi
+    key="$label|$target"
+    for seen in "${discovery_seen[@]}"; do
+        [[ $seen != "$key" ]] || return
+    done
+    ((discovery_count < 10)) || return
+    discovery_seen+=("$key")
+    ((discovery_count+=1))
+    printf '%s (%s; advertised, unverified): ' "$label" "$source"
+    safe_url "$target"; printf '\n'
+}
+html_metadata() {
+    local input lower tag name text rest
+    local tag_pattern="^(([^>\"']|\"[^\"]*\"|'[^']*')*)>"
+    local name_pattern='^[[:space:]]*([[:alnum:]]+)([[:space:]/]|$)'
+    local -A attrs=()
+    input=$(head -c 65536 "$get.body")
+    echo 'HTML metadata (best effort; first 64 KiB):'
+    while [[ $input == *'<'* ]]; do
+        input=${input#*<}
+        if [[ $input == '!--'* ]]; then
+            [[ $input == *'-->'* ]] || break
+            input=${input#*-->}; continue
+        fi
+        [[ $input =~ $tag_pattern ]] || break
+        tag=${BASH_REMATCH[1]}; input=${input:${#BASH_REMATCH[0]}}
+        [[ $tag =~ $name_pattern ]] || continue
+        name=${BASH_REMATCH[1],,}; rest=${tag:${#BASH_REMATCH[1]}}
+        case $name in
+            script|style|textarea|title)
+                lower=${input,,}
+                # Raw-text elements may contain fake tags. Skip through their closing tag.
+                local closing="</$name([[:space:]][^>]*)?>"
+                if [[ $lower =~ $closing ]]; then
+                    # Prefix length from the lowercased string (ASCII markup expected).
+                    rest=${lower%%"${BASH_REMATCH[0]}"*}
+                    text=${input:0:${#rest}}
+                    input=${input:${#rest}+${#BASH_REMATCH[0]}}
+                    if [[ $name == title && -z $html_title_seen ]]; then
+                        printf 'Title: '; html_text "$text"; printf '\n'; html_title_seen=1
+                    fi
+                else break; fi ;;
+            meta)
+                attributes "$rest"
+                text=${attrs[name]:-}
+                if [[ ${text,,} == generator && -n ${attrs[content]:-} ]]; then
+                    if ((generator_count < 3)); then
+                        printf 'Generator (self-reported): '; html_text "${attrs[content]}"; printf '\n'
+                        ((generator_count+=1))
+                    fi
+                fi ;;
+            link)
+                attributes "$rest"
+                text=$(html_text "${attrs[href]:-}" 65536)
+                advertised_link HTML "$text" "${attrs[rel]:-}" "${attrs[type]:-}" ;;
+        esac
+    done
+}
+link_metadata() {
+    local input matched target params
+    local pattern='<([^>]*)>(([^",]|"[^"]*")*)'
+    local -A attrs=()
+    input=$(header "$get" link)
+    input=${input:0:65536}
+    while [[ $input =~ $pattern ]]; do
+        matched=${BASH_REMATCH[0]}; target=${BASH_REMATCH[1]}; params=${BASH_REMATCH[2]}
+        input=${input#*"$matched"}
+        attributes "$params"
+        advertised_link 'GET Link header' "$target" "${attrs[rel]:-}" "${attrs[type]:-}"
+    done
+}
+
+section '1. Endpoint information'
+printf 'Requested: '; safe_url "$url"; printf '\n'
+current=$url
+for ((hop=0; hop<=3; hop++)); do
+    get="$tmp/get$hop"
+    request GET "$current" "$get"
+    status=$(meta "$get" '.http_code')
+    next=$(meta "$get" '.redirect_url')
+    [[ $(cat "$get.rc") == 0 && $status =~ ^3[0-9][0-9]$ && -n $next ]] || break
+    printf 'Redirect %s: ' "$status"; safe_url "$next"; printf '\n'
+    next_origin=$(origin "$next") || next_origin=''
+    if [[ $next_origin != "$base_origin" ]]; then observations+=('Redirect stopped at origin boundary.'); break; fi
+    if ((hop == 3)); then observations+=('GET redirect limit reached.'); break; fi
+    current=$next
+done
+printf 'Effective: '; safe_url "$current"; printf '\n'
+request HEAD "$current" "$tmp/head"
+request OPTIONS "$current" "$tmp/options"
+section '2. HTTP methods and status codes'
+for method in GET HEAD OPTIONS; do
+    case $method in GET) p=$get ;; HEAD) p=$tmp/head ;; OPTIONS) p=$tmp/options ;; esac
+    code=$(meta "$p" '.http_code')
+    printf '%-8s %s\n' "$method" "${code:-unavailable}"
+    [[ ! $code =~ ^5[0-9][0-9]$ ]] || observations+=("$method returned HTTP $code; investigate the server response.")
+done
+if [[ $(meta "$get" '.http_code') != "$(meta "$tmp/head" '.http_code')" ]]; then observations+=('GET and HEAD status codes differ.'); fi
+section '3. Response headers and metadata'
+printf 'HTTP version: %s\nDownloaded bytes: %s\nTotal time: %s s\n' \
+    "$(meta "$get" '.http_version')" "$(meta "$get" '.size_download')" "$(meta "$get" '.time_total')"
+headers=(server content-type content-length etag last-modified cache-control expires vary allow access-control-allow-origin access-control-allow-methods access-control-allow-headers access-control-allow-credentials access-control-expose-headers access-control-max-age link retry-after ratelimit-limit ratelimit-remaining x-ratelimit-limit x-ratelimit-remaining)
+if ((verbose)); then headers+=(content-encoding content-language accept-ranges age via x-request-id); fi
+for method in GET OPTIONS; do
+    if [[ $method == GET ]]; then p=$get; else p=$tmp/options; fi
+    for name in "${headers[@]}"; do
+        value=$(header "$p" "$name")
+        [[ $name != link || -z $value ]] || value="[present; value omitted because links may contain credentials]"
+        value=${value:0:500}
+        [[ -z $value ]] || printf '%s %s: %s\n' "$method" "$name" "$value"
+    done
+done
+for name in content-type content-length etag last-modified; do
+    a=$(header "$get" "$name"); b=$(header "$tmp/head" "$name")
+    [[ $a == "$b" ]] || observations+=("GET/HEAD $name differs (including possible missing metadata).")
+done
+allow=$(header "$tmp/options" allow)
+[[ -z $allow ]] || observations+=("OPTIONS advertises methods: $allow (not independently verified).")
+ctype=$(header "$get" content-type)
+section '4. Response content structure'
+valid=0
+if [[ $(cat "$get.rc") != 0 ]]; then
+    echo 'Incomplete transfer; JSON validity and structure not assessed.'
+elif jq -e -s 'length == 1' "$get.body" >/dev/null 2>&1; then
+    valid=1
+    depth=2; breadth=8; array_limit=3
+    if ((verbose)); then depth=4; breadth=20; array_limit=20; fi
+    jq -r --argjson depth "$depth" --argjson breadth "$breadth" --argjson array_limit "$array_limit" '
+        def overview($path; $level):
+            "\($path): \(type)" + (if type=="array" then " (\(length) elements)" elif type=="object" then " (\(length) keys)" else "" end),
+            (if $level < $depth then
+                if type=="object" then
+                    (to_entries[:$breadth][] | .key as $k | .value | overview($path+"["+($k[:100]|tojson)+"]"; $level+1)),
+                    (if length > $breadth then "  … additional keys omitted" else empty end)
+                elif type=="array" then
+                    (to_entries[:$array_limit][] | .key as $k | .value | overview($path+"[\($k)] (sample)"; $level+1)),
+                    (if length > $array_limit then "  … additional elements omitted" else empty end)
+                else empty end
+            else empty end);
+        overview("$"; 0)' "$get.body" | clean | head -c 12000
+    printf '\n'
+    hints=$(jq -r 'if type=="object" then [keys[] | select(test("(^|_)(id|links?|next|previous|page|total|errors?)(_|$)"; "i"))][:8] | map(.[0:100]) | join(", ") else empty end' "$get.body" | clean)
+    [[ -z $hints ]] || observations+=("Top-level properties worth exploring: $hints (name-based hints only).")
+    [[ ${ctype,,} == *json* ]] || observations+=('Body is JSON although Content-Type does not advertise JSON.')
+else
+    printf 'Non-JSON body; Content-Type: %s\n' "${ctype:-not provided}"
+    [[ ${ctype,,} != *json* ]] || observations+=('Content-Type advertises JSON, but the complete body is not one valid JSON value.')
+fi
+discovery_count=0 generator_count=0 html_title_seen=''
+discovery_seen=()
+if [[ ${ctype,,} == text/html* || ${ctype,,} == application/xhtml+xml* ]]; then
+    html_metadata
+fi
+link_metadata
+((discovery_count == 0)) || observations+=('Advertised API/JSON links found; no discovered links were requested.')
+section '5. Actual response preview'
+limit=1600
+((verbose == 0)) || limit=8000
+if ((valid)); then
+    # Bound containers before formatting; cut long scalar values before terminal output.
+    jq --argjson n "$((8 + verbose * 12))" --argjson array_limit "$((3 + verbose * 17))" '
+        def preview($d):
+            if $d == 0 and (type=="array" or type=="object") then "…"
+            elif type=="object" then to_entries[:$n] | map(.value |= preview($d-1)) | from_entries
+            elif type=="array" then .[:$array_limit] | map(preview($d-1))
+            elif type=="string" and length>300 then .[:300]+"…" else . end;
+        preview(3)' "$get.body" | clean | head -c "$limit"
+    printf '\n[Preview bounded; fields, elements or text may be omitted.]\n'
+elif [[ ${ctype,,} == text/* || ${ctype,,} == *json* || ${ctype,,} == *xml* ]]; then
+    head -c "$limit" "$get.body" | clean
+    printf '\n[Text preview limited to %s bytes.]\n' "$limit"
+else
+    echo 'Preview omitted for binary or unrecognized content type.'
+fi
+section '6. Interesting observations'
+if ((${#observations[@]})); then printf -- '- %s\n' "${observations[@]}"; else echo 'No additional observations from these basic checks.'; fi
+exit "$transport"

@@ -1,0 +1,17 @@
+name: Checks
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install runtime and lint dependencies
+        run: sudo apt-get update && sudo apt-get install -y curl jq shellcheck
+      - name: Bash syntax and ShellCheck
+        run: |
+          bash -n apiinfo
+          shellcheck apiinfo
+      - name: Local integration tests
+        run: python3 -m unittest discover -s tests -v
